@@ -1,0 +1,195 @@
+import { v4 as uuidv4 } from 'uuid';
+import dayjs from 'dayjs';
+
+const monthlyPartnumberMap = {
+  'Absenteeism': 'absenteeism',
+  'Absenteeism Fixo': 'absenteeism_fixo',
+  'Abs. (Just/ Injust/ Atest)': 'abs_just_injust_atest',
+  'Ac. Absent. Fixo': 'ac_absent_fixo',
+  'Ac. Abs. (Just/ Injust/ Atest)': 'ac_abs_just_injust_atest',
+  'Acumulado Total': 'acumulado_total',
+  'Absent. Faltas Legal': 'absent_faltas_legal',
+};
+
+const annualPartnumberMap = {
+  'Target': 'target',
+  '2024': 'ano_2024',
+  '2025': 'ano_2025',
+  'Abs. Geral/2025': 'abs_geral_2025',
+  'Absent. Fixo/2025': 'absent_fixo_2025',
+  'Abs. Geral/2024': 'abs_geral_2024',
+  'Absent. Fixo/2024': 'absent_fixo_2024'
+};
+
+export class PostAbesenteismo {
+  constructor(db) {
+    this.db = db;
+  }
+
+  // ---- GET MENSAL ----
+  async getAbsenteismoData(month) {
+    if (!month || !/^\d{4}-\d{2}$/.test(month)) {
+      throw new Error("Formato de mês inválido. Use YYYY-MM.");
+    }
+
+    const startDate = dayjs(month).startOf('month');
+    const daysInMonth = startDate.daysInMonth();
+
+    const [dbData] = await this.db.query(
+      `SELECT * FROM absenteismo WHERE data LIKE ?`,
+      [`${month}-%`]
+    );
+
+    const dataByDate = new Map(
+      dbData.map(row => [dayjs(row.data).format('YYYY-MM-DD'), row])
+    );
+
+    const rows = Object.keys(monthlyPartnumberMap).map(partnumber => {
+      const rowId = `month-${partnumber.toLowerCase().replace(/[^a-z0-9]/g, '-')}`;
+      const rowData = { id: rowId, partnumber };
+
+      for (let i = 1; i <= daysInMonth; i++) {
+        const currentDate = dayjs(`${month}-${i}`).format('YYYY-MM-DD');
+        const dbRowForDate = dataByDate.get(currentDate);
+        const dbColumnName = monthlyPartnumberMap[partnumber];
+        rowData[currentDate] = dbRowForDate ? (dbRowForDate[dbColumnName] ?? null) : null;
+      }
+
+      return rowData;
+    });
+
+    const rowAcumulado = rows.find(r => r.partnumber === "Acumulado Total");
+    if (rowAcumulado) {
+      const rowFixo = rows.find(r => r.partnumber === "Ac. Absent. Fixo");
+      const rowJust = rows.find(r => r.partnumber === "Ac. Abs. (Just/ Injust/ Atest)");
+
+      if (rowFixo && rowJust) {
+        for (let i = 1; i <= daysInMonth; i++) {
+          const key = dayjs(`${month}-${i}`).format('YYYY-MM-DD');
+          const valFixo = Number(rowFixo[key] ?? 0);
+          const valJust = Number(rowJust[key] ?? 0);
+          rowAcumulado[key] = valFixo + valJust;
+        }
+      }
+    }
+
+    return { rows };
+  }
+
+  // ---- UPDATE MENSAL ----
+  async updateAbsenteismo(updates) {
+    if (!updates || Object.keys(updates).length === 0) {
+      throw new Error("Nenhuma atualização fornecida.");
+    }
+
+    let conn;
+    try {
+      conn = await this.db.getConnection();
+      await conn.beginTransaction();
+
+      for (const date in updates) {
+        const changes = updates[date];
+        const [existing] = await conn.query(`SELECT uuid FROM absenteismo WHERE data = ?`, [date]);
+
+        let uuid = existing[0]?.uuid || uuidv4();
+        if (!existing[0]) {
+          await conn.query(`INSERT INTO absenteismo (uuid, data) VALUES (?, ?)`, [uuid, date]);
+        }
+
+        for (const partnumber in changes) {
+          const columnName = monthlyPartnumberMap[partnumber];
+          if (columnName) {
+            await conn.query(
+              `UPDATE absenteismo SET ${conn.escapeId(columnName)} = ? WHERE uuid = ?`,
+              [changes[partnumber], uuid]
+            );
+          }
+        }
+      }
+
+      await conn.commit();
+      return { success: true, message: 'Dados mensais atualizados!' };
+
+    } catch (e) {
+      if (conn) await conn.rollback();
+      throw e;
+    } finally {
+      if (conn) conn.release();
+    }
+  }
+
+  // ---- GET ANUAL ----
+  async getAnnualData(year) {
+    if (!year || !/^\d{4}$/.test(year)) {
+      throw new Error("Formato de ano inválido.");
+    }
+
+    const [dbData] = await this.db.query(
+      `SELECT * FROM absenteismo WHERE YEAR(data) = ? AND DAY(data) = 1`,
+      [year]
+    );
+
+    const dataByMonth = new Map(dbData.map(row => [dayjs(row.data).month() + 1, row]));
+
+    const rows = Object.keys(annualPartnumberMap).map(partnumber => {
+      const rowId = `year-${partnumber.toLowerCase().replace(/[^a-z0-9]/g, '-')}`;
+      const rowData = { id: rowId, partnumber };
+
+      const dbColumnName = annualPartnumberMap[partnumber];
+      for (let i = 1; i <= 12; i++) {
+        const dbRowForMonth = dataByMonth.get(i);
+        const key = `${year}-${String(i).padStart(2, '0')}`;
+        rowData[key] = dbRowForMonth ? (dbRowForMonth[dbColumnName] ?? null) : null;
+      }
+      return rowData;
+    });
+
+    return { rows };
+  }
+
+  // ---- UPDATE ANUAL ----
+  async updateAnnualData({ year, changedRows }) {
+    if (!changedRows || changedRows.length === 0) {
+      throw new Error("Nenhuma alteração fornecida.");
+    }
+
+    let conn;
+    try {
+      conn = await this.db.getConnection();
+      await conn.beginTransaction();
+
+      for (const row of changedRows) {
+        const dbColumnName = annualPartnumberMap[row.partnumber];
+        if (!dbColumnName) continue;
+
+        for (let i = 1; i <= 12; i++) {
+          const key = `${year}-${String(i).padStart(2, '0')}`;
+          if (row.hasOwnProperty(key)) {
+            const value = row[key];
+            const date = dayjs(`${year}-${i}-01`).format('YYYY-MM-DD');
+
+            const [existing] = await conn.query(`SELECT uuid FROM absenteismo WHERE data = ?`, [date]);
+            let uuid = existing[0]?.uuid || uuidv4();
+            if (!existing[0]) {
+              await conn.query(`INSERT INTO absenteismo (uuid, data) VALUES (?, ?)`, [uuid, date]);
+            }
+
+            await conn.query(
+              `UPDATE absenteismo SET ${conn.escapeId(dbColumnName)} = ? WHERE uuid = ?`,
+              [value, uuid]
+            );
+          }
+        }
+      }
+
+      await conn.commit();
+      return { success: true, message: 'Dados anuais atualizados!' };
+
+    } catch (e) {
+      if (conn) await conn.rollback();
+      throw e;
+    } finally {
+      if (conn) conn.release();
+    }
+  }
+}
