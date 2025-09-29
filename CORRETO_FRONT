@@ -1,0 +1,302 @@
+import { Box, Typography, Select, MenuItem, Button, Alert, TextField } from "@mui/material";
+import { useMemo, useState, useEffect } from "react";
+import { LocalizationProvider } from "@mui/x-date-pickers/LocalizationProvider";
+import { AdapterDayjs } from "@mui/x-date-pickers/AdapterDayjs";
+import { DatePicker } from "@mui/x-date-pickers/DatePicker";
+import { DataGridPremium, useGridApiContext } from "@mui/x-data-grid-premium";
+import dayjs from "dayjs";
+import axios from "@/services/axios";
+import toast from "react-hot-toast";
+import BackdropLoading from "@/components/BackdropLoading";
+
+// --- MAPAS AUXILIARES ---
+const monthNames = [
+   "Abr", "Mai", "Jun",
+  "Jul", "Ago", "Set", "Out", 
+  "Nov", "Dez", "Jan", "Fev", "Mar"
+];
+
+const viewOptions = [
+  { uuid: "view-monthly", area: "Mensal" },
+  { uuid: "view-annual", area: "Anual" },
+];
+
+// --- COMPONENTE DE EDIÇÃO ---
+function PercentageEditCell({ id, field, value } = {}) {
+  const apiRef = useGridApiContext();
+  const [inputValue, setInputValue] = useState(value != null ? String(value).replace(".", ",") : "");
+  const handleChange = (event) => {
+    const textValue = event.target.value;
+    setInputValue(textValue);
+    const numberValue = parseFloat(textValue.replace(/%/g, "").trim().replace(",", "."));
+    apiRef.current.setEditCellValue(
+      { id, field, value: !isNaN(numberValue) ? numberValue : null },
+      event
+    );
+  };
+  return (
+    <TextField
+      value={inputValue}
+      onChange={handleChange}
+      autoFocus
+      fullWidth
+      inputProps={{ style: { textAlign: "center" } }}
+      sx={{
+        height: "100%",
+        "& .MuiInputBase-root": { height: "100%", display: "flex", alignItems: "center" },
+        "& .MuiInputBase-input": { padding: "0" },
+        "& .MuiOutlinedInput-notchedOutline": { border: "none" },
+      }}
+    />
+  );
+}
+
+// --- COMPONENTE PRINCIPAL ---
+export default function Absenteismo() {
+  const [view, setView] = useState(viewOptions[0]);
+  const [month, setMonth] = useState(dayjs().startOf("month"));
+  const [rows, setRows] = useState([]);
+  const [originalRows, setOriginalRows] = useState([]);
+  const [columnKeys, setColumnKeys] = useState([]);
+
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+
+  useEffect(() => {
+    fetchData();
+  }, [month, view]);
+
+  // --- BUSCA DADOS ---
+  const fetchData = async () => {
+    setIsLoading(true);
+    try {
+      let response;
+      if (view.area === "Anual") {
+        response = await axios.get(`/absenteismo/dados-anuais`, {
+          params: { year: month.format("YYYY") },
+        });
+        console.log("Resposta Anual:", response.data);
+      } else {
+        response = await axios.get(`/absenteismo/dados`, {
+          params: { month: month.format("YYYY-MM") },
+        });
+        console.log("Resposta Mensal:", response.data);
+      }
+
+      const { rows: fetchedRows } = response.data;
+      console.log("Rows recebidos:", fetchedRows);
+      
+      // --- gera colunas dinamicamente ---
+      let generatedColumns = [];
+      if (view.area === "Mensal" && fetchedRows.length > 0) {
+        const sampleRow = fetchedRows[0];
+        generatedColumns = Object.keys(sampleRow)
+          .filter((key) => /^\d{4}-\d{2}-\d{2}$/.test(key)) // só datas
+          .map((key) => {
+            const date = dayjs(key);
+            return {
+              field: key,
+              header: date.format("DD"), // mostra dia
+            };
+          });
+      } else if (view.area === "Anual" && fetchedRows.length > 0) {
+        const sampleRow = fetchedRows[0];
+        generatedColumns = Object.keys(sampleRow)
+          .filter((key) => /^\d{4}-\d{2}$/.test(key)) // só ano-mês
+          .map((key) => {
+            const monthIndex = parseInt(key.split("-")[1], 10) - 1;
+            return {
+              field: key,
+              header: monthNames[monthIndex],
+            };
+          });
+      }
+
+      setColumnKeys(generatedColumns);
+      setRows(fetchedRows);
+      setOriginalRows(JSON.parse(JSON.stringify(fetchedRows)));
+    } catch (error) {
+      toast.error(`Falha ao carregar dados de absenteísmo (${view.area}).`);
+      console.error(`Erro no GET de dados (${view.area}):`, error);
+      setColumnKeys([]);
+      setRows([]);
+      setOriginalRows([]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  
+
+  // --- DIFERENÇAS ---
+  const diffs = useMemo(() => {
+    const originalMap = new Map(originalRows.map((row) => [row.id, row]));
+    return rows.filter((currentRow) => {
+      const originalRow = originalMap.get(currentRow.id);
+      if (!originalRow) return true;
+      for (const key of columnKeys.map((c) => c.field)) {
+        if ((originalRow[key] ?? null) !== (currentRow[key] ?? null)) {
+          return true;
+        }
+      }
+      return false;
+    });
+  }, [rows, originalRows, columnKeys]);
+
+  const dirtyCount = diffs.length;
+
+  // --- COLUNAS ---
+  const columns = useMemo(() => {
+    const fixed = [
+      {
+        field: "partnumber",
+        headerName: view.area === "Anual" ? "ANO" : "Indicador Mensal",
+        width: 260,
+        editable: false,
+        type: "string",
+      },
+    ];
+    const dynamicCols = columnKeys.map((kObj) => ({
+      field: kObj.field,
+      headerName: kObj.header,
+      width: 105,
+      type: "number",
+      editable: true,
+      align: "center",
+      headerAlign: "center",
+      renderCell: (params) => {
+        const v = params?.value;
+        if (v == null || isNaN(v)) return "";
+        return `${Number(v).toLocaleString("pt-BR", {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        })}%`;
+      },
+      renderEditCell: (params) => <PercentageEditCell {...params} />,
+    }));
+    return [...fixed, ...dynamicCols];
+  }, [columnKeys, view]);
+
+  // --- SALVAR ---
+  const handleSave = async () => {
+    setIsSaving(true);
+    try {
+      if (diffs.length === 0) {
+        toast.error("Nenhuma alteração para salvar.");
+        setIsSaving(false);
+        return;
+      }
+
+      if (view.area === "Anual") {
+        const payload = {
+          year: month.format("YYYY"),
+          changedRows: diffs,
+        };
+        await axios.post("/absenteismo/atualizar-anual", payload);
+      } else {
+        const updates = {};
+        const originalMap = new Map(originalRows.map((r) => [r.id, r]));
+        for (const currentRow of diffs) {
+          const originalRow = originalMap.get(currentRow.id);
+          for (const keyObj of columnKeys) {
+            const field = keyObj.field;
+            if ((originalRow?.[field] ?? null) !== (currentRow[field] ?? null)) {
+              if (!updates[field]) updates[field] = {};
+              updates[field][currentRow.partnumber] = currentRow[field] ?? null;
+            }
+          }
+        }
+        const payload = { month: month.format("YYYY-MM"), updates };
+        await axios.post("/absenteismo/atualizar", payload);
+      }
+
+      toast.success("Dados salvos com sucesso!");
+      await fetchData();
+    } catch (err) {
+      console.error("Erro ao salvar:", err);
+      toast.error(err.response?.data?.message || "Erro ao salvar os dados.");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleRevert = () => setRows(JSON.parse(JSON.stringify(originalRows)));
+  const processRowUpdate = (newRow) => {
+    setRows((prev) => prev.map((r) => (r.id === newRow.id ? newRow : r)));
+    return newRow;
+  };
+
+  if (isLoading) return <BackdropLoading />;
+
+  return (
+    <LocalizationProvider dateAdapter={AdapterDayjs}>
+      <Box sx={{ p: 2 }}>
+        <Typography variant="h4" gutterBottom>
+          Absenteísmo
+        </Typography>
+        {Boolean(dirtyCount) && (
+          <Alert severity="warning" sx={{ mb: 2 }}>
+            Existem {dirtyCount} linha(s) com alterações não salvas.
+          </Alert>
+        )}
+        <Box
+          sx={{
+            display: "flex",
+            gap: 2,
+            mb: 3,
+            bgcolor: "background.default",
+            p: 2,
+            borderRadius: 1,
+            border: "1px solid #CDCDCD",
+          }}
+        >
+          <DatePicker
+            label={view.area === "Anual" ? "Ano" : "Mês"}
+            views={view.area === "Anual" ? ["year"] : ["year", "month"]}
+            openTo={view.area === "Anual" ? "year" : "month"}
+            value={month}
+            onChange={(newValue) => {
+              if (newValue)
+                setMonth(dayjs(newValue).startOf(view.area === "Anual" ? "year" : "month"));
+            }}
+            format={view.area === "Anual" ? "YYYY" : "MM/YYYY"}
+          />
+          <Box sx={{ flex: 1, minWidth: 300 }}>
+            <Select
+              fullWidth
+              value={view.uuid}
+              onChange={(e) => {
+                const selected = viewOptions.find((a) => a.uuid === e.target.value);
+                if (selected) setView(selected);
+              }}
+            >
+              {viewOptions.map((opt) => (
+                <MenuItem key={opt.uuid} value={opt.uuid}>
+                  {opt.area}
+                </MenuItem>
+              ))}
+            </Select>
+          </Box>
+          <Button variant="outlined" onClick={handleRevert} disabled={!dirtyCount || isSaving}>
+            Reverter Alterações
+          </Button>
+          <Button variant="contained" onClick={handleSave} disabled={!dirtyCount || isSaving}>
+            Salvar Alterações {dirtyCount ? `(${dirtyCount})` : ""}
+          </Button>
+        </Box>
+        <Box sx={{ minHeight: 680, height: "72vh", width: "100%" }}>
+          <DataGridPremium
+            rowHeight={80}
+            loading={isSaving}
+            rows={rows}
+            getRowId={(row) => row.id}
+            columns={columns}
+            editMode="cell"
+            processRowUpdate={processRowUpdate}
+            experimentalFeatures={{ newEditingApi: true }}
+          />
+        </Box>
+      </Box>
+    </LocalizationProvider>
+  );
+}
